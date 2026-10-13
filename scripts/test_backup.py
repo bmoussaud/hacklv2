@@ -17,10 +17,15 @@ DUMP_BYTES = b"synthetic database dump\n"
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="inventory-backup-test-") as temporary:
         test_dir = pathlib.Path(temporary)
+        # The rootless container uses UID 10001 rather than the host user's UID.
+        test_dir.chmod(0o755)
         bin_dir = test_dir / "bin"
         bin_dir.mkdir()
         az_log = test_dir / "az-calls.txt"
         dump_path = test_dir / "dump-path.txt"
+        for output in (az_log, dump_path):
+            output.touch()
+            output.chmod(0o666)
         (bin_dir / "az").write_text(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AZ_MOCK_LOG\"\n",
             encoding="utf-8",
@@ -102,6 +107,8 @@ def main() -> None:
         restore_bin = test_dir / "restore-bin"
         restore_bin.mkdir()
         restore_log = test_dir / "restore-calls.txt"
+        restore_log.touch()
+        restore_log.chmod(0o666)
         expected_sha = hashlib.sha256(DUMP_BYTES).hexdigest()
         (restore_bin / "az").write_text(
             "#!/bin/sh\n"
