@@ -1,0 +1,12 @@
+location                = "northeurope"
+project_name            = "last-harvest"
+postgres_admin_username = "inventoryadmin"
+# Supply passwords using TF_VAR_postgres_admin_password, TF_VAR_app_db_password,
+# and TF_VAR_backup_db_password from an approved secret manager.
+allowed_users           = ["name@example.com"]
+deploy_application      = false
+deploy_backup_job       = false
+deploy_db_init_job      = false
+public_ingress_enabled  = false
+backup_schedule_utc     = "0 2 * * 0"
+backup_retention_days   = 90

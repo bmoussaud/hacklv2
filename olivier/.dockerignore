@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!config.php
+!db_connect.php
+!apache-site.conf
+!apache-rootless.conf
+!public/
+!public/**

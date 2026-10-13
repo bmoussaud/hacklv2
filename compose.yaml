@@ -1,0 +1,74 @@
+services:
+  app:
+    build:
+      context: ./olivier
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    environment:
+      DB_HOST: database
+      DB_PORT: "5432"
+      DB_NAME: inventory
+      DB_USER: inventory_app
+      DB_PASSWORD: "${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env before starting Compose}"
+      DB_SSLMODE: disable
+      AUTH_REQUIRED: "${AUTH_REQUIRED:-false}"
+      ALLOWED_USERS: "${ALLOWED_USERS:-}"
+      SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-false}"
+    depends_on:
+      database:
+        condition: service_healthy
+      db-bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - php
+        - -r
+        - "exit(@file_get_contents('http://127.0.0.1:8080/ready.php') === false ? 1 : 0);"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  db-bootstrap:
+    image: postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+    entrypoint: ["/bin/sh", "-c", "tr -d '\\r' < /bootstrap/bootstrap.sh | /bin/sh"]
+    environment:
+      PGHOST: database
+      PGPORT: "5432"
+      PGDATABASE: inventory
+      PGUSER: postgres
+      PGPASSWORD: "${DB_PASSWORD:?Set DB_PASSWORD in .env before starting Compose}"
+      APP_DB_USER: inventory_app
+      APP_DB_PASSWORD: "${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env before starting Compose}"
+      BACKUP_DB_USER: inventory_backup
+      BACKUP_DB_PASSWORD: "${BACKUP_DB_PASSWORD:?Set BACKUP_DB_PASSWORD in .env before starting Compose}"
+    volumes:
+      - ./olivier/bootstrap:/bootstrap:ro
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: "no"
+
+
+  database:
+    image: postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+    environment:
+      POSTGRES_DB: inventory
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?Set DB_PASSWORD in .env before starting Compose}"
+    volumes:
+      - inventory-data:/var/lib/postgresql/data
+      - ./olivier/init.sql:/docker-entrypoint-initdb.d/01-inventory.sql:ro
+    ports: []
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d inventory"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  inventory-data:

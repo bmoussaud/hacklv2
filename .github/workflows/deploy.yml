@@ -1,0 +1,183 @@
+name: Deploy inventory application
+
+on:
+  workflow_dispatch:
+    inputs:
+      initialize_database:
+        description: "Run the idempotent synthetic schema/role initializer (never resets stock quantities)"
+        required: true
+        type: boolean
+        default: true
+      enable_public_ingress:
+        description: "Expose the application after Entra authentication is configured"
+        required: true
+        type: boolean
+        default: false
+      run_restore:
+        description: "Restore a named Blob backup into a new isolated PostgreSQL database"
+        required: true
+        type: boolean
+        default: false
+      restore_blob_name:
+        description: "Existing backup blob name (required when run_restore is enabled)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: inventory-azure-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: hackathon
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_location: ${{ vars.AZURE_LOCATION }}
+      TF_VAR_postgres_admin_username: ${{ vars.POSTGRES_ADMIN_USERNAME }}
+      TF_VAR_postgres_admin_password: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+      TF_VAR_app_db_password: ${{ secrets.APP_DB_PASSWORD }}
+      TF_VAR_backup_db_password: ${{ secrets.BACKUP_DB_PASSWORD }}
+      TF_VAR_allowed_users: ${{ vars.ALLOWED_USERS_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Initialize protected remote state
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="use_azuread_auth=true"
+      - name: Require existing Entra protection before public ingress
+        if: inputs.enable_public_ingress
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          APP: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+        run: |
+          az containerapp auth show --resource-group "$RG" --name "$APP" --output json \
+            | jq -e '(.platform.enabled == true) and (.globalValidation.unauthenticatedClientAction == "RedirectToLoginPage")' >/dev/null
+      - name: Build and push immutable images
+        working-directory: .
+        env:
+          ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+        run: |
+          az acr login --name "$ACR_NAME"
+          registry="$(az acr show --name "$ACR_NAME" --query loginServer --output tsv)"
+          tag="${GITHUB_SHA}"
+          docker buildx build --push -f olivier/Dockerfile -t "$registry/inventory:$tag" olivier
+          docker buildx build --push -f olivier/backup/Dockerfile -t "$registry/inventory-backup:$tag" olivier/backup
+          docker buildx build --push -f infra/db-init.Dockerfile -t "$registry/inventory-db-init:$tag" .
+          app_digest="$(az acr manifest show-metadata --registry "$ACR_NAME" --name "inventory:$tag" --query digest --output tsv)"
+          backup_digest="$(az acr manifest show-metadata --registry "$ACR_NAME" --name "inventory-backup:$tag" --query digest --output tsv)"
+          init_digest="$(az acr manifest show-metadata --registry "$ACR_NAME" --name "inventory-db-init:$tag" --query digest --output tsv)"
+          {
+            echo "TF_VAR_app_image=$registry/inventory@$app_digest"
+            echo "TF_VAR_backup_image=$registry/inventory-backup@$backup_digest"
+            echo "TF_VAR_db_init_image=$registry/inventory-db-init@$init_digest"
+          } >> "$GITHUB_ENV"
+      - name: Apply private application, initializer, and scheduled backup job
+        run: |
+          terraform apply -input=false -auto-approve \
+            -var="app_image=${TF_VAR_app_image}" \
+            -var="backup_image=${TF_VAR_backup_image}" \
+            -var="db_init_image=${TF_VAR_db_init_image}" \
+            -var="deploy_application=true" \
+            -var="deploy_db_init_job=true" \
+            -var="deploy_backup_job=true" \
+            -var="deploy_restore_job=true" \
+            -var="public_ingress_enabled=${{ inputs.enable_public_ingress }}" \
+            -var="entra_auth_configured=${{ inputs.enable_public_ingress }}"
+      - name: Initialize database on explicit request
+        if: inputs.initialize_database
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          JOB: ${{ vars.AZURE_DB_INIT_JOB_NAME }}
+        run: |
+          execution="$(az containerapp job start --resource-group "$RG" --name "$JOB" --query name --output tsv)"
+          for attempt in $(seq 1 60); do
+            status="$(az containerapp job execution show --resource-group "$RG" --name "$JOB" \
+              --job-execution-name "$execution" --query properties.status --output tsv)"
+            case "$status" in
+              Succeeded) exit 0 ;;
+              Failed|Stopped) echo "Database initializer ended with status: $status" >&2; exit 1 ;;
+              *) sleep 10 ;;
+            esac
+          done
+          echo "Timed out waiting for the database initializer." >&2
+          exit 1
+      - name: Restore verified backup into an isolated database
+        if: inputs.run_restore
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          JOB: ${{ vars.AZURE_RESTORE_JOB_NAME }}
+          BLOB_NAME: ${{ inputs.restore_blob_name }}
+        run: |
+          if [[ -z "$BLOB_NAME" ]]; then
+            echo "restore_blob_name is required when run_restore is enabled." >&2
+            exit 1
+          fi
+          execution="$(az containerapp job start --resource-group "$RG" --name "$JOB" \
+            --env-vars "BLOB_NAME=$BLOB_NAME" --query name --output tsv)"
+          for attempt in $(seq 1 60); do
+            status="$(az containerapp job execution show --resource-group "$RG" --name "$JOB" \
+              --job-execution-name "$execution" --query properties.status --output tsv)"
+            case "$status" in
+              Succeeded) exit 0 ;;
+              Failed|Stopped) echo "Verified restore ended with status: $status" >&2; exit 1 ;;
+              *) sleep 10 ;;
+            esac
+          done
+          echo "Timed out waiting for the verified restore." >&2
+          exit 1
+      - name: Configure Entra Easy Auth before application exposure
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          APP: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+          TENANT_ID: ${{ secrets.ENTRA_TENANT_ID }}
+          ENTRA_CLIENT_ID: ${{ secrets.ENTRA_APP_CLIENT_ID }}
+          ENTRA_CLIENT_SECRET: ${{ secrets.ENTRA_APP_CLIENT_SECRET }}
+        run: |
+          az containerapp auth update --resource-group "$RG" --name "$APP" \
+            --enabled true --unauthenticated-client-action RedirectToLoginPage \
+            --redirect-provider AzureActiveDirectory --require-https true \
+            --excluded-paths /health.php /ready.php --yes --output none
+          az containerapp auth microsoft update --resource-group "$RG" --name "$APP" \
+            --tenant-id "$TENANT_ID" --client-id "$ENTRA_CLIENT_ID" \
+            --client-secret "$ENTRA_CLIENT_SECRET" \
+            --client-secret-name microsoft-provider-authentication-secret \
+            --issuer "https://login.microsoftonline.com/$TENANT_ID/v2.0" \
+            --allowed-audiences "$ENTRA_CLIENT_ID" --yes --output none
+      - name: Verify deployment and report URL
+        env:
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          APP: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+        run: |
+          az containerapp show --resource-group "$RG" --name "$APP" --output none
+          fqdn="$(az containerapp show --resource-group "$RG" --name "$APP" --query properties.configuration.ingress.fqdn --output tsv)"
+          anonymous_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://$fqdn/index.php")"
+          if [[ "$anonymous_status" != "302" && "$anonymous_status" != "401" && "$anonymous_status" != "403" ]]; then
+            echo "Anonymous request returned HTTP $anonymous_status instead of being denied." >&2
+            exit 1
+          fi
+          echo "Application URL: https://$fqdn"
