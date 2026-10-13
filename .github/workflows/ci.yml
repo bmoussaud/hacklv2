@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  app-and-compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate PHP image and application behavior
+        run: python scripts/test_compose.py
+
+  backup-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Azure Blob backup image
+        run: docker build -f olivier/backup/Dockerfile -t inventory-backup:ci olivier/backup
+      - name: Check backup script syntax
+        run: |
+          docker run --rm --entrypoint /bin/sh inventory-backup:ci -n /usr/local/bin/backup.sh
+          docker run --rm --entrypoint /bin/sh inventory-backup:ci -n /usr/local/bin/restore.sh
+      - name: Exercise backup flow without cloud credentials
+        run: python scripts/test_backup.py inventory-backup:ci
+
+  database-init-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build database initializer
+        run: docker build -f infra/db-init.Dockerfile -t inventory-db-init:ci .
+      - name: Check initializer scripts
+        run: |
+          docker run --rm --entrypoint /bin/sh inventory-db-init:ci -n /usr/local/bin/db-init.sh
+          docker run --rm --entrypoint /bin/sh inventory-db-init:ci -n /opt/inventory/bootstrap.sh
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive infra
+      - name: Initialize Terraform providers without remote state
+        run: terraform -chdir=infra init -backend=false -input=false
+      - name: Validate Terraform configuration
+        run: terraform -chdir=infra validate

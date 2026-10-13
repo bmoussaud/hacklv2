@@ -1,0 +1,58 @@
+name: Provision Azure infrastructure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: inventory-azure-infrastructure
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    environment: hackathon
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_location: ${{ vars.AZURE_LOCATION }}
+      TF_VAR_postgres_admin_username: ${{ vars.POSTGRES_ADMIN_USERNAME }}
+      TF_VAR_postgres_admin_password: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+      TF_VAR_app_db_password: ${{ secrets.APP_DB_PASSWORD }}
+      TF_VAR_backup_db_password: ${{ secrets.BACKUP_DB_PASSWORD }}
+      TF_VAR_allowed_users: ${{ vars.ALLOWED_USERS_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Configure protected Azure Blob remote state
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="use_azuread_auth=true"
+      - name: Provision private Azure foundation (cost-incurring)
+        run: |
+          terraform apply -input=false -auto-approve \
+            -var="deploy_application=false" \
+            -var="deploy_db_init_job=false" \
+            -var="deploy_backup_job=false" \
+            -var="public_ingress_enabled=false"
